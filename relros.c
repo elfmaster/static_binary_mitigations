@@ -1,10 +1,34 @@
 /*
+ * Copyright (c) 2018, Ryan O'Neill
+ * All rights reserved.
+ * 
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer. 
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+/*
  * gcc relros.c -o relros
  * ./relros <target_executable>
  */
 
 #define _GNU_SOURCE
-#include "./include/libelfmaster.h"
 
 #include <assert.h>
 #include <elf.h>
@@ -30,12 +54,39 @@
 #define PAGE_ALIGN_UP(x) (PAGE_ALIGN(x) + PAGE_SIZE)
 #define PAGE_ROUND(x) (PAGE_ALIGN_UP(x))
 
+
 struct segment {
 	uint64_t vaddr;
 	uint64_t offset;
 	uint64_t memsz;
 	uint64_t filesz;
 };
+
+/*
+ * We have removed all calls to libelfmaster since it is not yet open sourced and
+ * are using a minimalistic set of code for resolving symbols.
+ */
+typedef struct elfobj2 {
+	uint8_t *mem;
+	ElfW(Ehdr) *ehdr;
+	ElfW(Phdr) *phdr;
+	ElfW(Shdr) *shdr;
+	ElfW(Sym) *symtab;
+	bool dynamic_linked;
+	size_t symcount;
+	int fd;
+	char *shstrtab;
+	char *strtab;
+	struct stat st;
+	uint64_t text_offset;
+	uint64_t text_base;
+	size_t size;
+	char *path;
+} elfobj2_t;
+
+bool _elf_symbol_by_name(elfobj2_t *, char *, ElfW(Sym) *);
+void * _elf_address_pointer(elfobj2_t *, uint64_t);
+bool _elf_open_object(char *, elfobj2_t *);
 
 #define IP_RELATIVE_ADDR(target) \
     (get_rip() - ((char *)&get_rip_label - (char *)target))
@@ -71,6 +122,117 @@ __write(long fd, char *buf, unsigned long len)
         return ret;
 }
 #endif
+
+void *
+_elf_text_pointer(elfobj2_t *obj, uint64_t addr)
+{
+	uint64_t offset = obj->text_offset + addr - obj->text_base;
+
+	printf("%lx - %lx = %lx\n", addr, obj->text_base, addr - obj->text_base);
+	if (offset > obj->size - 1)
+		return NULL;
+	return (void *)((uint8_t *)&obj->mem[offset]);
+}
+
+bool
+_elf_symbol_by_name(elfobj2_t *obj, char *name, ElfW(Sym) *out)
+{
+
+	ElfW(Sym) *sym = obj->symtab;
+	char *strtab = obj->strtab;
+	char *tmp;
+	int i;
+
+	for (i = 0; i < obj->symcount; i++) {
+		if (strcmp(&strtab[sym[i].st_name], name) == 0) {
+			memcpy(out, &sym[i], sizeof(*out));
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+_elf_close_object(elfobj2_t *obj)
+{
+	int ret;
+
+	ret = munmap(obj->mem, obj->size);
+	return ret != 0 ? false : true;
+}
+
+bool
+_elf_open_object(char *path, struct elfobj2 *obj)
+{
+	int fd, i;
+	ElfW(Ehdr) *ehdr;
+	ElfW(Phdr) *phdr;
+	ElfW(Shdr) *shdr;
+	ElfW(Sym) *symtab;
+	char *shstrtab;
+	char *strtab;
+	struct stat st;
+	uint8_t *mem;
+
+	fd = open(path, O_RDWR);
+	if (fd < 0) {
+		perror("open");
+		return false;
+	}
+	if (fstat(fd, &st) < 0) {
+		perror("fstat");
+		return false;
+	}
+	memset(obj, 0, sizeof(*obj));
+
+	mem = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
+	if (mem == MAP_FAILED) {
+		perror("mmap");
+		return false;
+	}
+	ehdr = (ElfW(Ehdr) *)mem;
+	phdr = (ElfW(Phdr) *)&mem[ehdr->e_phoff];
+	shdr = (ElfW(Shdr) *)&mem[ehdr->e_shoff];
+	shstrtab = (char *)&mem[shdr[ehdr->e_shstrndx].sh_offset];
+
+	/*
+	 * Grab the data segments offset and base for use in our
+	 * elf_address_pointer function
+	 */
+	for (i = 0; i < ehdr->e_phnum; i++) {
+		if (phdr[i].p_type == PT_LOAD && phdr[i].p_offset == 0) {
+			obj->text_offset = phdr[i].p_offset;
+			obj->text_base = phdr[i].p_vaddr;
+		}
+		if (phdr[i].p_type == PT_DYNAMIC)
+			obj->dynamic_linked = true;
+	}
+	/*
+	 * Grab the symbol table and string table .strtab. for future
+	 * symbol resolution.
+	 */
+	for (i = 0; i < ehdr->e_shnum; i++) {
+		    if (strcmp(&shstrtab[shdr[i].sh_name], ".symtab") == 0) {
+			symtab = (ElfW(Sym) *)&mem[shdr[i].sh_offset];
+			obj->symcount = shdr[i].sh_size / shdr[i].sh_entsize;
+		} else if (strcmp(&shstrtab[shdr[i].sh_name], ".strtab") == 0) {
+			strtab = (char *)&mem[shdr[i].sh_offset];
+		}
+	}
+
+	obj->symtab = symtab;
+	obj->path = path;
+	obj->size = st.st_size;
+	obj->mem = mem;
+	obj->st = st;
+	obj->ehdr = ehdr;
+	obj->phdr = phdr;
+	obj->shdr = shdr;
+	obj->fd = fd;
+	obj->strtab = strtab;
+	obj->shstrtab = shstrtab;
+	return true;
+}
 
 #define PUSH_LEN 5
 #define PUSH_RET_LEN 6 /* push 0x00000000; ret */
@@ -238,7 +400,7 @@ delta_end(void) { volatile uintptr_t esoteric = (uintptr_t)&__environ; return; }
 #define TRAMPOLINE_OFFSET GENERIC_START_MAIN_PATCH_OFFSET
 
 bool
-inject_relro_code(elfobj_t *obj)
+inject_relro_code(elfobj2_t *obj)
 {
 	int i, fd;
 	size_t injection_size, old_size = obj->size;
@@ -247,26 +409,26 @@ inject_relro_code(elfobj_t *obj)
 	const size_t relro_stub_size = (const size_t)((char *)&delta_end -
 	    (char *)&unused_delta_begin);
 	size_t new_map_size;
-	struct elf_symbol generic_start_main, main_sym;
+	ElfW(Sym) generic_start_main, main_sym;
 	uint64_t generic_start_main_off, patch_vaddr, main_offset;
 	uint8_t *ptr;
 	const int magic_mark = 0xdeadbeef;
 
-	if (elf_symbol_by_name(obj, "generic_start_main",
+	if (_elf_symbol_by_name(obj, "generic_start_main",
 	    &generic_start_main) == false) {
 		fprintf(stderr, "elf_symbol_by_name failed\n");
 		return false;
 	}
-	if (elf_symbol_by_name(obj, "main",
+	if (_elf_symbol_by_name(obj, "main",
 	    &main_sym) == false) {
 		fprintf(stderr, "elf_symbol_by_name failed\n");
 		return false;
 	}
 
-	ptr = elf_address_pointer(obj, generic_start_main.value);
+	ptr = _elf_text_pointer(obj, generic_start_main.st_value);
 	if (ptr == NULL) {
 		fprintf(stderr, "%#lx could not be found in address range\n",
-		    generic_start_main.value);
+		    generic_start_main.st_value);
 		return false;
 	}
 	/*
@@ -293,7 +455,7 @@ inject_relro_code(elfobj_t *obj)
 	 * clobbers the next instructions and forces us to call exit() after
 	 * main() but before the .dtors/.fini_array pointers are called.
 	 */
-	patch_vaddr = generic_start_main.value + TRAMPOLINE_OFFSET;
+	patch_vaddr = generic_start_main.st_value + TRAMPOLINE_OFFSET;
 	ptr += TRAMPOLINE_OFFSET;
 	ptr[0] = 0xe8; /* call imm */
 	main_offset = vaddr  - patch_vaddr - 5;
@@ -307,19 +469,19 @@ inject_relro_code(elfobj_t *obj)
 	 * these values directly since libelfmaster doesn't
 	 * support modification yet.
 	 */
-	for (i = 0; i < obj->ehdr64->e_phnum; i++) {
-		if (obj->phdr64[i].p_type != PT_NOTE)
+	for (i = 0; i < obj->ehdr->e_phnum; i++) {
+		if (obj->phdr[i].p_type != PT_NOTE)
 			continue;
-		obj->phdr64[i].p_type = PT_LOAD;
-		relro_stub_vaddr = obj->phdr64[i].p_vaddr =
+		obj->phdr[i].p_type = PT_LOAD;
+		relro_stub_vaddr = obj->phdr[i].p_vaddr =
 		    0xc000000 + old_size;
 		injection_size = relro_stub_size;
-		obj->phdr64[i].p_filesz = relro_stub_size + PADDING_SIZE;
-		obj->phdr64[i].p_memsz = obj->phdr64[i].p_filesz;
-		obj->phdr64[i].p_flags = PF_R | PF_X;
-		obj->phdr64[i].p_align = 0x200000;
-		obj->phdr64[i].p_paddr = obj->phdr64[i].p_vaddr;
-		obj->phdr64[i].p_offset = old_size;
+		obj->phdr[i].p_filesz = relro_stub_size + PADDING_SIZE;
+		obj->phdr[i].p_memsz = obj->phdr[i].p_filesz;
+		obj->phdr[i].p_flags = PF_R | PF_X;
+		obj->phdr[i].p_align = 0x200000;
+		obj->phdr[i].p_paddr = obj->phdr[i].p_vaddr;
+		obj->phdr[i].p_offset = old_size;
 
 	}
 	fd = open(TMP_FILE, O_RDWR|O_CREAT|O_TRUNC, S_IRWXU);
@@ -333,10 +495,10 @@ inject_relro_code(elfobj_t *obj)
 	 * view our enable_relro() code with objdump
 	 * during debugging phases.
 	 */
-	obj->shdr64[1].sh_offset = old_size;
-	obj->shdr64[1].sh_addr = 0xc000000 + old_size;
-	obj->shdr64[1].sh_size = relro_stub_size + 16;
-	obj->shdr64[1].sh_type = SHT_PROGBITS;
+	obj->shdr[1].sh_offset = old_size;
+	obj->shdr[1].sh_addr = 0xc000000 + old_size;
+	obj->shdr[1].sh_size = relro_stub_size + 16;
+	obj->shdr[1].sh_type = SHT_PROGBITS;
 #endif
 	if (write(fd, obj->mem, old_size) < 0) {
 		perror("write1");
@@ -344,13 +506,13 @@ inject_relro_code(elfobj_t *obj)
 	}
 	printf("injection size: %lu\n", injection_size);
 
-	(void) write(fd, &main_sym.value, 4);
+	(void) write(fd, &main_sym.st_value, 4);
 
 	if (write(fd, (char *)&enable_relro, injection_size) < 0) {
 		perror("write2");
 		return false;
 	}
-	printf("main(): %#lx\n", main_sym.value);
+	printf("main(): %#lx\n", main_sym.st_value);
 	close(fd);
 	if (rename(TMP_FILE, obj->path) < 0) {
 		perror("rename");
@@ -360,20 +522,20 @@ inject_relro_code(elfobj_t *obj)
 }	
 int main(int argc, char **argv)
 {
-	elfobj_t obj;
-	elf_error_t error;
+
+	elfobj2_t obj;
 
 	if (argc < 2) {
 		printf("Usage: %s <static_executable>\n", argv[0]);
 		exit(EXIT_FAILURE);
 	}
 
-	if (elf_open_object(argv[1], &obj, true, &error) == false) {
-		fprintf(stderr, "%s\n", elf_error_msg(&error));
+	if (_elf_open_object(argv[1], &obj) == false) {
+		fprintf(stderr, "_elf_open_object failed\n");
 		exit(EXIT_FAILURE);
 	}
 
-	if (obj.flags & ELF_DYNAMIC_F) {
+	if (obj.dynamic_linked == true) {
 		/*
 		 * If there is a PT_DYNAMIC segment then we know
 		 * this isn't a static executable.
@@ -387,6 +549,6 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	elf_close_object(&obj);
+	_elf_close_object(&obj);
 }
 

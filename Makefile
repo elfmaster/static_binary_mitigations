@@ -1,5 +1,5 @@
 all:
-	gcc -g relros.c libelfmaster_pre_beta/libelfmaster.a -o relros
+	gcc -g relros.c -o relros
 	gcc -g static_to_dyn.c -o static_to_dyn
 	gcc -static test.c -o test
 	gcc -nostdlib -c -fPIC test2.c -o test2.o

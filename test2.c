@@ -7,7 +7,7 @@ static int test_dummy = 5;
 
 int _start() {
 	int argc;
-	long *args;
+	long **args;
 	long *rbp;
 	int i;
 	int j = 0;
@@ -19,7 +19,7 @@ int _start() {
         asm __volatile__("lea 16(%%rbp), %%rcx " : "=c" (args));
 	
 	for (i = 0; i < argc; i++) {
-		sleep(10);
+		sleep(1);
 		printf("%s\n", (char *)args[i]);
 	}
 	exit(0);
